@@ -33,6 +33,12 @@ POLL_INTERVAL   = int(_get("POLL_INTERVAL", "30"))     # seconds between polls
 LOG_TAIL_LINES  = int(_get("LOG_TAIL_LINES", "15"))    # log lines to fetch per deployment
 ALERT_COOLDOWN  = int(_get("ALERT_COOLDOWN", "120"))   # seconds before re-alerting same deployment
 
+# Resource thresholds — alert when a service crosses these
+CPU_THRESHOLD_PCT      = float(_get("CPU_THRESHOLD_PCT", "85"))
+MEMORY_THRESHOLD_PCT   = float(_get("MEMORY_THRESHOLD_PCT", "85"))
+METRICS_CHECK_EVERY    = int(_get("METRICS_CHECK_EVERY", "3"))        # check metrics every N poll ticks
+METRICS_ALERT_COOLDOWN = int(_get("METRICS_ALERT_COOLDOWN", "600"))   # seconds before re-alerting same service
+
 # Display
 EMBED_COLOR     = _get("EMBED_COLOR", "8B5CF6")        # default purple to match Railway
 BOT_NAME        = _get("BOT_NAME", "Railway Monitor")
