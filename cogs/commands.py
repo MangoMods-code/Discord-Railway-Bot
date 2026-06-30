@@ -1,6 +1,7 @@
 # cogs/commands.py — Slash commands for manual Railway interaction.
 # /railway status   — live overview of all projects
 # /railway logs     — tail logs for a specific deployment
+# /railway metrics  — on-demand CPU/memory check
 # /railway redeploy — trigger a redeploy
 # /railway projects — list all projects with service counts
 
@@ -14,7 +15,7 @@ from discord.ext import commands
 import config as cfg
 from helpers import (
     error_embed, success_embed, status_embed,
-    deploy_event_embed, log_alert_embed, EMBED_COLOR,
+    deploy_event_embed, log_alert_embed, metrics_embed, EMBED_COLOR,
     truncate, format_bytes, railway_footer, classify_log_batch,
     STATUS_EMOJI, STATUS_COLORS,
 )
@@ -73,9 +74,8 @@ class RailwayCommands(commands.Cog):
             )
             embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-            # Pull latest deployment per environment
             dep_lines = []
-            for env in envs[:3]:  # cap at 3 envs per project to stay under embed limits
+            for env in envs[:3]:
                 try:
                     deps = await self.railway.get_recent_deployments(
                         project["id"], env["id"], limit=1
@@ -166,7 +166,6 @@ class RailwayCommands(commands.Cog):
         except RailwayAPIError as e:
             return await interaction.followup.send(embed=error_embed(f"```{e}```"))
 
-        # Find matching project
         project = next(
             (p for p in projects if p["name"].lower() == project_name.lower()), None
         )
@@ -178,7 +177,6 @@ class RailwayCommands(commands.Cog):
                 )
             )
 
-        # Find matching environment
         env = next(
             (
                 e["node"]
@@ -197,7 +195,6 @@ class RailwayCommands(commands.Cog):
                 )
             )
 
-        # Get latest deployment
         try:
             deps = await self.railway.get_recent_deployments(
                 project["id"], env["id"], limit=1
@@ -220,7 +217,6 @@ class RailwayCommands(commands.Cog):
         messages = [e.get("message", "") for e in log_entries if e.get("message")]
 
         if not messages:
-            # Try build logs as fallback
             build_entries = await self.railway.get_build_logs(dep_id)
             messages = [e.get("message", "") for e in build_entries if e.get("message")]
 
@@ -240,6 +236,85 @@ class RailwayCommands(commands.Cog):
         )
         embed.title = f"📋  Logs — {project['name']}"
         await interaction.followup.send(embed=embed)
+
+    # ── /railway metrics ───────────────────────────────────────────────────────
+
+    @railway_group.command(
+        name="metrics",
+        description="Check current CPU/memory usage for every service in a project",
+    )
+    @app_commands.describe(
+        project_name="Name of the Railway project",
+        environment="Environment name (default: production)",
+    )
+    async def metrics(
+        self,
+        interaction: discord.Interaction,
+        project_name: str,
+        environment: str = "production",
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            projects = await self.railway.get_projects()
+        except RailwayAPIError as e:
+            return await interaction.followup.send(embed=error_embed(f"```{e}```"))
+
+        project = next(
+            (p for p in projects if p["name"].lower() == project_name.lower()), None
+        )
+        if not project:
+            names = ", ".join(f"`{p['name']}`" for p in projects)
+            return await interaction.followup.send(
+                embed=error_embed(f"Project `{project_name}` not found.\n\nAvailable: {names}")
+            )
+
+        env = next(
+            (
+                e["node"]
+                for e in project["environments"]["edges"]
+                if e["node"]["name"].lower() == environment.lower()
+            ),
+            None,
+        )
+        if not env:
+            env_names = ", ".join(
+                f"`{e['node']['name']}`" for e in project["environments"]["edges"]
+            )
+            return await interaction.followup.send(
+                embed=error_embed(f"Environment `{environment}` not found.\n\nAvailable: {env_names}")
+            )
+
+        services = [e["node"] for e in project["services"]["edges"]]
+        if not services:
+            return await interaction.followup.send(
+                embed=error_embed(f"No services found in **{project_name}**.")
+            )
+
+        pages = []
+        for svc in services:
+            data = await self.railway.get_service_metrics(svc["id"], env["id"])
+            if not data:
+                pages.append(
+                    status_embed(
+                        f"📊  {svc['name']}",
+                        "No metrics available — service may not be running.",
+                    )
+                )
+                continue
+
+            cpu_pct = data.get("cpuPercentage") or 0.0
+            mem_bytes = data.get("memoryUsageBytes") or 0
+            mem_limit = data.get("memoryLimitBytes") or 0
+            pages.append(
+                metrics_embed(project["name"], svc["name"], env["name"], cpu_pct, mem_bytes, mem_limit)
+            )
+
+        if len(pages) == 1:
+            await interaction.followup.send(embed=pages[0])
+        else:
+            view = PaginatorView(pages, interaction.user.id)
+            await interaction.followup.send(embed=pages[0], view=view)
 
     # ── /railway redeploy ─────────────────────────────────────────────────────
 
