@@ -1,7 +1,6 @@
 # cogs/monitor.py — Core Railway polling loop. Detects new deployments,
-# status changes, log anomalies, and build failures. Posts alerts to Discord.
+# status changes, log anomalies, build failures, and resource threshold breaches.
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,7 +14,6 @@ from helpers import (
     deploy_event_embed,
     log_alert_embed,
     metrics_embed,
-    SEVERITY_COLORS,
 )
 from railway_api import RailwayClient, RailwayAPIError
 
@@ -30,6 +28,9 @@ NOTIFY_ON_STATUS = {
     "SLEEPING", "REMOVED",
 }
 
+# Statuses where a running service actually has live metrics to pull.
+METRICS_ELIGIBLE_STATUSES = {"SUCCESS", "DEPLOYING", "BUILDING"}
+
 
 class MonitorCog(commands.Cog):
     def __init__(self, bot: commands.Bot, railway: RailwayClient):
@@ -40,11 +41,14 @@ class MonitorCog(commands.Cog):
         self._deployment_status: dict[str, str] = {}
         # deployment_id → last log tail joined (dedup guard)
         self._last_log_tail: dict[str, str] = {}
-        # deployment_id → epoch of last alert (cooldown)
+        # deployment_id → epoch of last log alert (cooldown)
         self._alert_timestamps: dict[str, float] = {}
         # set of deployment_ids we've already sent a log alert for at "info" level
-        # (we suppress info log alerts after the first one to avoid spam)
         self._info_alerted: set[str] = set()
+        # service_id → epoch of last metrics alert (separate cooldown, longer window)
+        self._metrics_alert_timestamps: dict[str, float] = {}
+
+        self._tick_count = 0
 
         self.poll_loop.change_interval(seconds=cfg.POLL_INTERVAL)
         self.poll_loop.start()
@@ -66,7 +70,6 @@ class MonitorCog(commands.Cog):
         raw = cfg.ALERT_CHANNEL_ID
         if raw and str(raw).isdigit():
             return self.bot.get_channel(int(raw))
-        # Fall back to the first log channel
         chans = self._log_channels()
         return chans[0] if chans else None
 
@@ -102,13 +105,16 @@ class MonitorCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _tick(self):
+        self._tick_count += 1
+        check_metrics_this_tick = self._tick_count % cfg.METRICS_CHECK_EVERY == 0
+
         projects = await self.railway.get_projects()
         for project in projects:
             for env_edge in project["environments"]["edges"]:
                 env = env_edge["node"]
-                await self._check_env(project, env)
+                await self._check_env(project, env, check_metrics_this_tick)
 
-    async def _check_env(self, project: dict, env: dict):
+    async def _check_env(self, project: dict, env: dict, check_metrics: bool):
         try:
             deployments = await self.railway.get_recent_deployments(
                 project["id"], env["id"], limit=3
@@ -121,12 +127,16 @@ class MonitorCog(commands.Cog):
             return
 
         for dep in deployments:
-            await self._process_deployment(project, env, dep)
+            await self._process_deployment(project, env, dep, check_metrics)
 
-    async def _process_deployment(self, project: dict, env: dict, dep: dict):
+    async def _process_deployment(
+        self, project: dict, env: dict, dep: dict, check_metrics: bool
+    ):
         dep_id = dep["id"]
         status = dep["status"]
-        service_name = (dep.get("service") or {}).get("name", "unknown")
+        service = dep.get("service") or {}
+        service_id = service.get("id")
+        service_name = service.get("name", "unknown")
 
         prev_status = self._deployment_status.get(dep_id)
         self._deployment_status[dep_id] = status
@@ -138,7 +148,6 @@ class MonitorCog(commands.Cog):
             )
             await self._send_to_log(embed)
 
-            # High-priority ping for crash/fail
             if status in ("CRASHED", "FAILED"):
                 owner = cfg.OWNER_ID
                 mention = f"<@{owner}>" if owner else ""
@@ -147,6 +156,10 @@ class MonitorCog(commands.Cog):
         # Fetch and evaluate logs for terminal or active deployments
         if status in TERMINAL_STATUSES or prev_status != status:
             await self._check_logs(project, env, dep, service_name, status)
+
+        # Resource metrics — only for live services, only on the slower cadence
+        if check_metrics and service_id and status in METRICS_ELIGIBLE_STATUSES:
+            await self._check_metrics(project, env, service_id, service_name)
 
     async def _check_logs(
         self,
@@ -158,17 +171,14 @@ class MonitorCog(commands.Cog):
     ):
         dep_id = dep["id"]
 
-        # Cooldown check
         now = datetime.now(timezone.utc).timestamp()
         last_alert = self._alert_timestamps.get(dep_id, 0)
         if now - last_alert < cfg.ALERT_COOLDOWN:
             return
 
-        # Fetch runtime logs
         log_entries = await self.railway.get_deployment_logs(dep_id)
         messages = [e.get("message", "") for e in log_entries if e.get("message")]
 
-        # If empty runtime logs and it's a build failure, pull build logs
         if not messages and status == "FAILED":
             build_entries = await self.railway.get_build_logs(dep_id)
             messages = [e.get("message", "") for e in build_entries if e.get("message")]
@@ -185,8 +195,6 @@ class MonitorCog(commands.Cog):
 
         severity = classify_log_batch(tail)
 
-        # Suppress info-level log embeds after the first to avoid channel spam.
-        # Errors and warnings always post.
         if severity == "info":
             if dep_id in self._info_alerted:
                 return
@@ -206,6 +214,35 @@ class MonitorCog(commands.Cog):
             await self._send_to_log(embed)
 
         self._alert_timestamps[dep_id] = now
+
+    async def _check_metrics(
+        self, project: dict, env: dict, service_id: str, service_name: str
+    ):
+        metrics = await self.railway.get_service_metrics(service_id, env["id"])
+        if not metrics:
+            return
+
+        cpu_pct = metrics.get("cpuPercentage") or 0.0
+        mem_bytes = metrics.get("memoryUsageBytes") or 0
+        mem_limit = metrics.get("memoryLimitBytes") or 0
+        mem_pct = (mem_bytes / mem_limit * 100) if mem_limit else 0.0
+
+        breached = cpu_pct >= cfg.CPU_THRESHOLD_PCT or mem_pct >= cfg.MEMORY_THRESHOLD_PCT
+        if not breached:
+            return
+
+        now = datetime.now(timezone.utc).timestamp()
+        last_alert = self._metrics_alert_timestamps.get(service_id, 0)
+        if now - last_alert < cfg.METRICS_ALERT_COOLDOWN:
+            return
+        self._metrics_alert_timestamps[service_id] = now
+
+        embed = metrics_embed(
+            project["name"], service_name, env["name"], cpu_pct, mem_bytes, mem_limit
+        )
+        owner = cfg.OWNER_ID
+        mention = f"<@{owner}>" if owner else ""
+        await self._send_alert(embed, content=mention)
 
 
 async def setup(bot: commands.Bot):
