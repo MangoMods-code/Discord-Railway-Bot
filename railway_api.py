@@ -1,5 +1,7 @@
 # railway_api.py — All Railway GraphQL API calls, clean and centralized.
+# Includes exponential backoff on 429 rate limits.
 
+import asyncio
 import logging
 from typing import Optional
 import aiohttp
@@ -7,6 +9,9 @@ import aiohttp
 logger = logging.getLogger("railway_api")
 
 RAILWAY_GQL = "https://backboard.railway.app/graphql/v2"
+
+# Backoff state — shared across all queries so a 429 on one call slows all of them
+_backoff_until: float = 0.0
 
 
 class RailwayAPIError(Exception):
@@ -21,8 +26,35 @@ class RailwayClient:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        self._backoff_seconds = 0.0  # current backoff window
+        self._backoff_until = 0.0    # epoch when we can retry
+
+    def _is_backed_off(self) -> bool:
+        import time
+        return time.monotonic() < self._backoff_until
+
+    def _on_rate_limit(self):
+        import time
+        # Double backoff on each consecutive 429, cap at 5 minutes
+        self._backoff_seconds = min((self._backoff_seconds or 30) * 2, 300)
+        self._backoff_until = time.monotonic() + self._backoff_seconds
+        logger.warning(
+            "Rate limited by Railway. Backing off for %.0fs.", self._backoff_seconds
+        )
+
+    def _on_success(self):
+        # Reset backoff on any successful call
+        self._backoff_seconds = 0.0
+        self._backoff_until = 0.0
 
     async def _query(self, gql: str, variables: Optional[dict] = None) -> dict:
+        if self._is_backed_off():
+            import time
+            wait = self._backoff_until - time.monotonic()
+            raise RailwayAPIError(
+                f"Railway API rate limited (backing off {wait:.0f}s remaining)"
+            )
+
         payload = {"query": gql, "variables": variables or {}}
         try:
             async with self.session.post(
@@ -31,15 +63,17 @@ class RailwayClient:
                 headers=self._headers,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
+                if resp.status == 429:
+                    self._on_rate_limit()
+                    raise RailwayAPIError("Railway API rate limited (429)")
                 if resp.status == 401:
                     raise RailwayAPIError("Railway token invalid or expired (401)")
-                if resp.status == 429:
-                    raise RailwayAPIError("Railway API rate limited (429)")
                 resp.raise_for_status()
                 data = await resp.json()
                 if "errors" in data:
                     msgs = "; ".join(e.get("message", "unknown") for e in data["errors"])
                     raise RailwayAPIError(f"GQL errors: {msgs}")
+                self._on_success()
                 return data.get("data", {})
         except aiohttp.ClientConnectionError as e:
             raise RailwayAPIError(f"Connection error: {e}") from e
@@ -49,10 +83,6 @@ class RailwayClient:
     # ── PROJECTS ──────────────────────────────────────────────────────────────
 
     async def get_projects(self) -> list[dict]:
-        """Fetch all projects. Workspace-scoped tokens use `projects` root query.
-        Personal tokens use `me { projects }`. We try workspace first, fall back to me."""
-
-        # Workspace-scoped token path
         workspace_gql = """
         query {
           projects(first: 100) {
@@ -91,7 +121,6 @@ class RailwayClient:
         except RailwayAPIError as e:
             logger.debug("Workspace project query failed, trying me path: %s", e)
 
-        # Personal token fallback
         me_gql = """
         query {
           me {
